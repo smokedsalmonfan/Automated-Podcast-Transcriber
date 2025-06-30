@@ -1,0 +1,273 @@
+# Step 1: Install necessary libraries
+# Make sure to run this in your terminal if you haven't already:
+!pip install torch torchaudio faster-whisper yt_dlp feedparser requests psutil
+# For GPU support, you will also need to install the appropriate CUDA toolkit libraries.
+
+import gc
+import psutil
+import torch
+from faster_whisper import WhisperModel
+import yt_dlp
+import feedparser
+import os
+import re
+from datetime import datetime, timedelta, timezone
+import requests
+
+# --- Configuration ---
+
+PODCAST_LIST = [
+    {"name": "The All-In Podcast", "url": "https://allinchamathjason.libsyn.com/rss"},
+    {"name": "Invest Like the Best", "url": "https://podcasts.apple.com/us/podcast/invest-like-the-best-with-patrick-oshaughnessy/id1154105909"},
+    {"name": "Acquired", "url": "https://podcasts.apple.com/us/podcast/acquired/id1050462261"},
+    {"name": "Bloomberg Odd Lots", "url": "https://podcasts.apple.com/us/podcast/odd-lots/id1056200096"},
+    {"name": "Animal Spirits", "url": "https://podcasts.apple.com/us/podcast/animal-spirits-podcast/id1310192007"},
+    {"name": "In Good Company with Nicolai Tangen", "url": "https://podcasts.apple.com/gb/podcast/in-good-company-with-nicolai-tangen/id1614211565"},
+    {"name": "JP Morgan Making Sense", "url": "https://podcasts.apple.com/us/podcast/making-sense/id1456184829"},
+    {"name": "Freakonomics Radio", "url": "https://podcasts.apple.com/us/podcast/freakonomics-radio/id354668519"},
+    {"name": "Pivot", "url": "https://feeds.megaphone.fm/VMP5013180598"},
+    {"name": "Capital Allocators", "url": "https://podcasts.apple.com/us/podcast/capital-allocators-inside-the-institutional/id1223764016"},
+    {"name": "Morgan Stanley Thoughts on the Market", "url": "https://podcasts.apple.com/lk/podcast/thoughts-on-the-market/id1466686717"},
+    {"name": "Goldman Sachs Exchanges", "url": "https://podcasts.apple.com/us/podcast/goldman-sachs-exchanges/id948913991"},
+    {"name": "Mel Faber Show", "url": "https://podcasts.apple.com/us/podcast/the-meb-faber-show-better-investing/id1128955736"},
+    {"name": "MacroVoices", "url": "https://podcasts.apple.com/us/podcast/macro-voices/id1079172742"},
+    {"name": "UBS On-Air Market Moves", "url": "https://podcasts.apple.com/gb/podcast/ubs-on-air-market-moves/id1447407862"},
+    {"name": "Excess Returns", "url": "https://podcasts.apple.com/gb/podcast/excess-returns/id1490296778"}
+]
+
+# --- Step 2: Load Faster-Whisper Model ---
+
+def print_memory_usage():
+    process = psutil.Process()
+    mem_info = process.memory_info()
+    print(f"Memory usage: {mem_info.rss / 1024**2:.2f} MB")
+
+print("Loading Faster-Whisper model...")
+try:
+    model_size = "tiny"  # Use tiny model to reduce RAM usage
+    if torch.cuda.is_available():
+        print("GPU is available. Using 'tiny' model with float16 compute type.")
+        model = WhisperModel(model_size, device="cuda", compute_type="float16")
+    else:
+        print("GPU not available. Using 'tiny' model with int8 compute type for CPU.")
+        model = WhisperModel(model_size, device="cpu", compute_type="int8")
+    print_memory_usage()
+except Exception as e:
+    print(f"Error loading Faster-Whisper model: {e}")
+    exit()
+print("Model loaded successfully.")
+
+# --- Step 3: Apple Podcast URL to RSS Feed ---
+
+def get_rss_from_apple_url(apple_url):
+    try:
+        match = re.search(r'id(\d+)', apple_url)
+        if not match:
+            print(f"Could not extract podcast ID from URL: {apple_url}")
+            return None
+        podcast_id = match.group(1)
+        itunes_url = f"https://itunes.apple.com/lookup?id={podcast_id}"
+        response = requests.get(itunes_url)
+        response.raise_for_status()
+        data = response.json()
+        if data.get('resultCount', 0) > 0:
+            feed_url = data['results'][0].get('feedUrl')
+            if feed_url:
+                print(f"Resolved Apple Podcast URL to RSS feed: {feed_url}")
+                return feed_url
+            else:
+                print(f"No RSS feed found for podcast ID {podcast_id}")
+                return None
+        else:
+            print(f"No results found for podcast ID {podcast_id}")
+            return None
+    except Exception as e:
+        print(f"Error resolving Apple Podcast URL {apple_url}: {e}")
+        return None
+
+# --- Step 4: Audio Handling ---
+
+def download_audio(url, output_path, limit_duration=False):
+    print(f"Downloading audio from: {url}")
+    try:
+        ydl_opts = {
+            'format': 'bestaudio/best',
+            'postprocessors': [{
+                'key': 'FFmpegExtractAudio',
+                'preferredcodec': 'mp3',
+                'preferredquality': '128',
+            }],
+            'outtmpl': output_path.replace('.mp3', ''),
+            'keepvideo': False,
+            'nooverwrites': True,
+            'quiet': True,
+        }
+        if limit_duration:
+            ydl_opts['postprocessor_args'] = ['-t', '5400']  # Limit to 90 minutes
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            ydl.download([url])
+        if os.path.exists(output_path):
+            print(f"Audio downloaded successfully to: {output_path}")
+            return output_path
+        else:
+            base_name = output_path.replace('.mp3', '')
+            if os.path.exists(base_name + '.mp3'):
+                os.rename(base_name + '.mp3', output_path)
+                print(f"Audio downloaded successfully to: {output_path}")
+                return output_path
+            print(f"Error: yt-dlp did not produce the expected file: {output_path}")
+            return None
+    except Exception as e:
+        print(f"Error downloading audio: {e}")
+        return None
+
+# --- Step 5: Transcription ---
+
+def transcribe_audio(audio_file_path, pause_threshold=0.75):
+    if not os.path.exists(audio_file_path):
+        print(f"Audio file not found at: {audio_file_path}")
+        return None
+    try:
+        print(f"Transcribing {audio_file_path} using faster-whisper...")
+        segments, info = model.transcribe(audio_file_path, word_timestamps=True, vad_filter=True)
+        def format_time(seconds):
+            minutes = int(seconds // 60)
+            seconds_remaining = seconds % 60
+            return f"{minutes:02d}:{seconds_remaining:06.3f}"
+        full_transcript = ""
+        previous_word_end = 0.0
+        for segment in segments:
+            for word in segment.words:
+                if word.start - previous_word_end > pause_threshold:
+                    timestamp = format_time(word.start)
+                    full_transcript += f"\n\n[{timestamp}]"
+                full_transcript += " " + word.word.strip()
+                previous_word_end = word.end
+        print("Transcription completed.")
+        return full_transcript.strip()
+    except Exception as e:
+        print(f"Error transcribing audio: {e}")
+        return None
+
+# --- Step 6: Save Transcription ---
+
+def save_transcription_to_rtf(transcription, podcast_name, episode_title, publish_date, output_dir="transcripts"):
+    try:
+        os.makedirs(output_dir, exist_ok=True)
+        safe_title = re.sub(r'[\\/*?:"<>|]', "", episode_title)
+        filename = f"{podcast_name} - {publish_date.strftime('%Y-%m-%d')} - {safe_title}.rtf"
+        output_path = os.path.join(output_dir, filename)
+        rtf_header = "{\\rtf1\\ansi\\deff0\n"
+        safe_podcast_name = podcast_name.replace('\\', '\\\\').replace('{', '\\{').replace('}', '\\}')
+        safe_episode_title = episode_title.replace('\\', '\\\\').replace('{', '\\{').replace('}', '\\}')
+        rtf_title = f"{{\\b\\fs32 {safe_podcast_name}: {safe_episode_title}}}\\par\\n"
+        rtf_date = f"{{\\fs24 Published on: {publish_date.strftime('%B %d, %Y')}}}\\par\\par\\n"
+        rtf_body = ""
+        for paragraph in transcription.split('\n\n'):
+            if paragraph.strip():
+                clean_paragraph = paragraph.strip().replace('\\', '\\\\').replace('{', '\\{').replace('}', '\\}')
+                rtf_body += f"{clean_paragraph}\\par\\par\n"
+        rtf_footer = "}"
+        rtf_content = rtf_header + rtf_title + rtf_date + rtf_body + rtf_footer
+        with open(output_path, "w", encoding='utf-8') as rtf_file:
+            rtf_file.write(rtf_content)
+        print(f"Transcription saved to: {output_path}")
+    except Exception as e:
+        print(f"Error saving transcription: {e}")
+
+# --- Step 7: Process Podcast Entry ---
+
+def process_podcast_entry(entry, podcast_name, time_limit):
+    publish_time_struct = entry.get("published_parsed")
+    if not publish_time_struct:
+        print(f"No publication date for episode in {podcast_name}. Skipping.")
+        return False
+    publish_date = datetime.fromtimestamp(
+        datetime(*publish_time_struct[:6]).timestamp(),
+        tz=timezone.utc
+    )
+    if publish_date > time_limit:
+        episode_title = entry.get('title', 'Unknown Episode')
+        print(f"Found new episode: '{episode_title}' (Published: {publish_date.strftime('%Y-%m-%d %H:%M:%S %Z')})")
+        # Check duration
+        limit_duration = False
+        duration = entry.get('itunes_duration', None)
+        if duration:
+            try:
+                if ':' in duration:
+                    time_parts = list(map(int, duration.split(':')))
+                    if len(time_parts) == 3:
+                        seconds = time_parts[0] * 3600 + time_parts[1] * 60 + time_parts[2]
+                    elif len(time_parts) == 2:
+                        seconds = time_parts[0] * 60 + time_parts[1]
+                    else:
+                        seconds = time_parts[0]
+                else:
+                    seconds = int(duration)
+                if seconds > 5400:  # 90 minutes
+                    print(f"Episode duration {seconds}s exceeds 90 minutes. Limiting to first 90 minutes.")
+                    limit_duration = True
+            except (ValueError, TypeError) as e:
+                print(f"Could not parse duration for '{episode_title}': {duration}. Limiting to 90 minutes.")
+                limit_duration = True
+        else:
+            print(f"No duration info for '{episode_title}'. Limiting to 90 minutes to be safe.")
+            limit_duration = True
+        audio_url = None
+        if 'enclosures' in entry:
+            for enclosure in entry.enclosures:
+                if 'audio' in enclosure.type:
+                    audio_url = enclosure.href
+                    break
+        if not audio_url:
+            print("Could not find an audio URL for this episode. Skipping.")
+            return False
+        temp_audio_path = f"temp_audio_{re.sub(r'[^a-zA-Z0-9]', '', episode_title[:20])}.mp3"
+        downloaded_file = download_audio(audio_url, temp_audio_path, limit_duration=limit_duration)
+        if downloaded_file:
+            transcription = transcribe_audio(downloaded_file)
+            if transcription:
+                save_transcription_to_rtf(transcription, podcast_name, episode_title, publish_date)
+            print(f"Cleaning up temporary file: {downloaded_file}")
+            if os.path.exists(downloaded_file):
+                os.remove(downloaded_file)
+            gc.collect()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+            print_memory_usage()
+        return True
+    return False
+
+# --- Step 8: Main Function ---
+
+def main():
+    print("\nStarting podcast check...")
+    now = datetime.now(timezone.utc)
+    time_limit = now - timedelta(hours=24)
+    for podcast in PODCAST_LIST:
+        print(f"\n--- Checking podcast: {podcast['name']} ---")
+        new_episodes_found = 0
+        try:
+            url = podcast['url']
+            if "podcasts.apple.com" in url:
+                print("Apple Podcast link detected. Attempting to resolve to RSS feed...")
+                rss_url = get_rss_from_apple_url(url)
+                if not rss_url:
+                    print(f"Could not resolve RSS feed for {podcast['name']}. Skipping.")
+                    continue
+                url = rss_url
+            feed = feedparser.parse(url)
+            if feed.bozo:
+                print(f"Warning: Feed for {podcast['name']} may be malformed. Bozo reason: {feed.bozo_exception}")
+            for entry in feed.entries:
+                if process_podcast_entry(entry, podcast['name'], time_limit):
+                    new_episodes_found += 1
+            if new_episodes_found == 0:
+                print("No new episodes found in the last 24 hours.")
+        except Exception as e:
+            print(f"Failed to process feed for {podcast['name']}. Error: {e}")
+    print("\nPodcast check finished.")
+
+# Run the script
+if __name__ == "__main__":
+    main()
