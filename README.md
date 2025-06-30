@@ -1,0 +1,1 @@
+This is a Python script, designed to work in Colab, that goes through a list of podcasts and, if there's a new one, transcribes it. The default list is set to financial markets-relevant podcasts but obviously you can customize. It works with either Apple or RSS podcast.
